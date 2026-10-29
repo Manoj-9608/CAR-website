@@ -58,35 +58,54 @@
 
     loadSingleFrame(index) {
       return new Promise((resolve) => {
-        if (this.cache.has(index)) {
-          resolve(this.cache.get(index));
+        const clampIndex = Math.max(1, Math.min(index, this.frameCount));
+        if (this.cache.has(clampIndex)) {
+          resolve(this.cache.get(clampIndex));
           return;
         }
+
         const img = new Image();
-        img.src = this.getPath(index);
-        
+        let settled = false;
+
+        const onDone = () => {
+          if (settled) return;
+          settled = true;
+          this.cache.set(clampIndex, img);
+          this.loadedIndices.add(clampIndex);
+          resolve(img);
+        };
+
+        const onError = () => {
+          if (settled) return;
+          settled = true;
+          resolve(null);
+        };
+
+        // Safety timeout so no single frame hangs the pipeline
+        const timer = setTimeout(onError, 3000);
+
         const finish = () => {
-          if ('decode' in img) {
-            img.decode().then(() => {
-              this.cache.set(index, img);
-              this.loadedIndices.add(index);
-              resolve(img);
-            }).catch(() => {
-              this.cache.set(index, img);
-              this.loadedIndices.add(index);
-              resolve(img);
-            });
+          clearTimeout(timer);
+          if (typeof img.decode === 'function') {
+            img.decode().then(onDone).catch(onDone);
           } else {
-            this.cache.set(index, img);
-            this.loadedIndices.add(index);
-            resolve(img);
+            onDone();
           }
         };
 
+        // Attach listeners BEFORE assigning src
         img.onload = finish;
         img.onerror = () => {
-          resolve(null);
+          clearTimeout(timer);
+          onError();
         };
+
+        img.src = this.getPath(clampIndex);
+
+        // If already cached or complete, finish immediately
+        if (img.complete) {
+          finish();
+        }
       });
     }
 
@@ -97,22 +116,27 @@
         return;
       }
 
-      // Preload initial frames concurrently in chunks
-      const chunkSize = 8;
-      for (let i = 1; i <= target; i += chunkSize) {
-        const chunkPromises = [];
-        for (let j = i; j < i + chunkSize && j <= target; j++) {
-          chunkPromises.push(
-            this.loadSingleFrame(j).then(() => {
-              this.initialLoadedCount++;
-              if (this.onInitialLoadProgress) {
-                this.onInitialLoadProgress(this.initialLoadedCount, target);
-              }
-            })
-          );
+      let loadedCount = 0;
+      const onFrameLoaded = () => {
+        loadedCount++;
+        if (this.onInitialLoadProgress) {
+          this.onInitialLoadProgress(loadedCount, target);
         }
-        await Promise.all(chunkPromises);
+      };
+
+      // Preload initial frames in parallel
+      const framePromises = [];
+      for (let i = 1; i <= target; i++) {
+        framePromises.push(this.loadSingleFrame(i).then(onFrameLoaded));
       }
+
+      // Hard safety timeout: Never freeze the site for more than 3.5 seconds
+      const safetyTimeout = new Promise((resolve) => setTimeout(resolve, 3500));
+
+      await Promise.race([
+        Promise.all(framePromises),
+        safetyTimeout
+      ]);
 
       if (this.onInitialLoadComplete) {
         this.onInitialLoadComplete();
@@ -227,8 +251,8 @@
     }
 
     const cursorEl = document.getElementById('cursor');
-    const labelEl = cursorEl.querySelector('.cursor-label');
     if (!cursorEl) return;
+    const labelEl = cursorEl.querySelector('.cursor-label');
 
     let mouseX = window.innerWidth / 2;
     let mouseY = window.innerHeight / 2;
@@ -821,20 +845,24 @@
     const barEl = document.getElementById('preloader-bar');
     const counterEl = document.getElementById('preloader-counter');
 
-    let currentPercent = 0;
+    let isDismissed = false;
 
     function updatePreloaderDisplay(pct) {
-      if (barEl) barEl.style.width = `${pct}%`;
-      if (counterEl) counterEl.textContent = String(Math.round(pct)).padStart(3, '0');
+      const clamped = Math.min(Math.max(pct, 0), 100);
+      if (barEl) barEl.style.width = `${clamped}%`;
+      if (counterEl) counterEl.textContent = String(Math.round(clamped)).padStart(3, '0');
     }
 
     heroSequence.onInitialLoadProgress = (loaded, total) => {
-      const pct = Math.min((loaded / total) * 100, 100);
-      currentPercent = pct;
+      if (isDismissed) return;
+      const pct = (loaded / total) * 100;
       updatePreloaderDisplay(pct);
     };
 
-    heroSequence.onInitialLoadComplete = () => {
+    const dismissPreloader = () => {
+      if (isDismissed) return;
+      isDismissed = true;
+
       updatePreloaderDisplay(100);
 
       // Flash exit highlight on line
@@ -854,9 +882,14 @@
         heroSequence.startBackgroundStreaming(CFG.hero.initialPreloadCount + 1);
         setTimeout(() => {
           dismantleSequence.startBackgroundStreaming(1);
-        }, 1500);
+        }, 1200);
       }, 350);
     };
+
+    heroSequence.onInitialLoadComplete = dismissPreloader;
+
+    // Hard safety timer: Preloader will never stay stuck for more than 4 seconds
+    setTimeout(dismissPreloader, 4000);
 
     heroSequence.preloadInitial();
   }
