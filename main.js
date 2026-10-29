@@ -540,49 +540,10 @@
 
     // Track car drawing boundaries for coordinate anchoring
     let carBounds = { x: 0, y: 0, width: 0, height: 0 };
-
-    function resizeCanvas() {
-      dpr = Math.min(window.devicePixelRatio || 1, CFG.hardware.maxDevicePixelRatio);
-      canvasWidth = window.innerWidth;
-      canvasHeight = window.innerHeight;
-      canvas.width = canvasWidth * dpr;
-      canvas.height = canvasHeight * dpr;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      lastDrawnFrame = -1;
-      updateCalloutPositions();
-    }
-    resizeCanvas();
-    window.addEventListener('resize', resizeCanvas, { passive: true });
-
-    // Build callout elements in the DOM
-    calloutsLayer.innerHTML = '';
-    const calloutElements = CFG.dismantle.callouts.map((c) => {
-      const container = document.createElement('div');
-      container.className = 'callout-item';
-      container.id = `callout-${c.id}`;
-
-      container.innerHTML = `
-        <svg class="callout-svg">
-          <line class="callout-line" x1="0" y1="0" x2="0" y2="0"></line>
-          <circle class="callout-dot" cx="0" cy="0" r="3"></circle>
-        </svg>
-        <div class="callout-card">
-          <span class="callout-tag mono-hud">${c.label}</span>
-          <span class="callout-desc">${c.text}</span>
-        </div>
-      `;
-
-      calloutsLayer.appendChild(container);
-      return {
-        config: c,
-        container: container,
-        line: container.querySelector('.callout-line'),
-        dot: container.querySelector('.callout-dot'),
-        card: container.querySelector('.callout-card')
-      };
-    });
+    let calloutElements = [];
 
     function updateCalloutPositions() {
+      if (!calloutElements || calloutElements.length === 0) return;
       const stageW = canvasWidth;
       const stageH = canvasHeight;
 
@@ -608,6 +569,47 @@
         item.card.style.top = `${labelY}px`;
       });
     }
+
+    // Build callout elements in the DOM
+    calloutsLayer.innerHTML = '';
+    calloutElements = CFG.dismantle.callouts.map((c) => {
+      const container = document.createElement('div');
+      container.className = 'callout-item';
+      container.id = `callout-${c.id}`;
+
+      container.innerHTML = `
+        <svg class="callout-svg">
+          <line class="callout-line" x1="0" y1="0" x2="0" y2="0"></line>
+          <circle class="callout-dot" cx="0" cy="0" r="3"></circle>
+        </svg>
+        <div class="callout-card">
+          <span class="callout-tag mono-hud">${c.label}</span>
+          <span class="callout-desc">${c.text}</span>
+        </div>
+      `;
+
+      calloutsLayer.appendChild(container);
+      return {
+        config: c,
+        container: container,
+        line: container.querySelector('.callout-line'),
+        dot: container.querySelector('.callout-dot'),
+        card: container.querySelector('.callout-card')
+      };
+    });
+
+    function resizeCanvas() {
+      dpr = Math.min(window.devicePixelRatio || 1, CFG.hardware.maxDevicePixelRatio);
+      canvasWidth = window.innerWidth;
+      canvasHeight = window.innerHeight;
+      canvas.width = canvasWidth * dpr;
+      canvas.height = canvasHeight * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      lastDrawnFrame = -1;
+      updateCalloutPositions();
+    }
+    resizeCanvas();
+    window.addEventListener('resize', resizeCanvas, { passive: true });
 
     function renderCanvas(frameNum) {
       ctx.fillStyle = '#07080A';
@@ -898,39 +900,47 @@
      10. MAIN APP BOOTSTRAP
      ========================================================================== */
   function initApp() {
-    // Setup frame sequence instances
-    const heroSequence = new FrameSequence({
-      frameCount: CFG.hero.frameCount,
-      desktopPath: CFG.hero.desktopPath,
-      mobilePath: CFG.hero.mobilePath,
-      initialPreloadCount: CFG.hero.initialPreloadCount
-    });
+    try {
+      // Setup frame sequence instances
+      const heroSequence = new FrameSequence({
+        frameCount: CFG.hero.frameCount,
+        desktopPath: CFG.hero.desktopPath,
+        mobilePath: CFG.hero.mobilePath,
+        initialPreloadCount: CFG.hero.initialPreloadCount
+      });
 
-    const dismantleSequence = new FrameSequence({
-      frameCount: CFG.dismantle.frameCount,
-      desktopPath: CFG.dismantle.desktopPath,
-      mobilePath: CFG.dismantle.mobilePath,
-      initialPreloadCount: 0
-    });
+      const dismantleSequence = new FrameSequence({
+        frameCount: CFG.dismantle.frameCount,
+        desktopPath: CFG.dismantle.desktopPath,
+        mobilePath: CFG.dismantle.mobilePath,
+        initialPreloadCount: 0
+      });
 
-    window.addEventListener('resize', () => {
-      heroSequence.handleResize();
-      dismantleSequence.handleResize();
-    }, { passive: true });
+      window.addEventListener('resize', () => {
+        heroSequence.handleResize();
+        dismantleSequence.handleResize();
+      }, { passive: true });
 
-    // Initialize Global Systems
-    initFilmGrain();
-    initCustomCursor();
-    initNav();
+      // Always initialize Preloader FIRST so it starts immediately and can never be blocked
+      initPreloader(heroSequence, dismantleSequence);
 
-    // Initialize Interactive Sections
-    initHeroScrolly(heroSequence);
-    initStatementReveal();
-    initDismantleScrolly(dismantleSequence);
-    initLineupAccordion();
+      // Initialize Global Systems safely
+      try { initFilmGrain(); } catch (e) { console.error('Film grain init error:', e); }
+      try { initCustomCursor(); } catch (e) { console.error('Cursor init error:', e); }
+      try { initNav(); } catch (e) { console.error('Nav init error:', e); }
 
-    // Kickoff Preloader & Asset Pipeline
-    initPreloader(heroSequence, dismantleSequence);
+      // Initialize Interactive Sections safely
+      try { initHeroScrolly(heroSequence); } catch (e) { console.error('Hero scrolly error:', e); }
+      try { initStatementReveal(); } catch (e) { console.error('Statement error:', e); }
+      try { initDismantleScrolly(dismantleSequence); } catch (e) { console.error('Dismantle error:', e); }
+      try { initLineupAccordion(); } catch (e) { console.error('Lineup error:', e); }
+
+    } catch (globalErr) {
+      console.error('Fatal initialization error:', globalErr);
+      // Hard fallback: hide preloader so user is NEVER trapped
+      const preloader = document.getElementById('preloader');
+      if (preloader) preloader.classList.add('is-finished');
+    }
   }
 
   if (document.readyState === 'loading') {
