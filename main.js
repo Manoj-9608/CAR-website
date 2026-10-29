@@ -1,6 +1,6 @@
 /**
- * NOCTIS — Scrollytelling Engine & Interactive Controller
- * Vanilla JavaScript (ES6+), zero frameworks, 60fps target.
+ * NOCTIS — Ultra-High Performance Scrollytelling Engine
+ * Vanilla JavaScript (ES6+), 60fps locked, Zero Forced Reflows.
  */
 
 (function () {
@@ -12,26 +12,27 @@
     return;
   }
 
-  // Detect Reduced Motion preference
   const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   /* ==========================================================================
-     1. FRAME ASSET MANAGER & BACKGROUND STREAMER
+     1. HIGH-SPEED FRAME ASSET MANAGER
+     Fast O(1) cache, nearest-frame memory, prioritized lookahead streaming.
      ========================================================================== */
-  class FrameSequence {
+  class FastFrameSequence {
     constructor(options) {
       this.frameCount = options.frameCount;
       this.getDesktopPath = options.desktopPath;
       this.getMobilePath = options.mobilePath;
       this.cache = new Map();
-      this.loadedIndices = new Set();
       this.isMobile = window.innerWidth <= CFG.hardware.mobileBreakpoint;
-      this.loadQueue = [];
-      this.isStreaming = false;
-      this.onInitialLoadProgress = options.onProgress || null;
-      this.onInitialLoadComplete = options.onComplete || null;
       this.initialPreloadTarget = options.initialPreloadCount || 0;
-      this.initialLoadedCount = 0;
+      this.lastReturnedFrame = null;
+      this.activeRequests = 0;
+      this.maxConcurrent = 4;
+      this.pendingQueue = [];
+      this.isStreaming = false;
+      this.onInitialProgress = options.onProgress || null;
+      this.onInitialComplete = options.onComplete || null;
     }
 
     getPath(index) {
@@ -42,16 +43,26 @@
     getFrame(index) {
       const clampIndex = Math.max(1, Math.min(index, this.frameCount));
       if (this.cache.has(clampIndex)) {
-        return this.cache.get(clampIndex);
+        const img = this.cache.get(clampIndex);
+        this.lastReturnedFrame = img;
+        return img;
       }
-      // Nearest loaded frame fallback
-      let offset = 1;
-      while (offset < this.frameCount) {
-        const prev = clampIndex - offset;
-        if (prev >= 1 && this.cache.has(prev)) return this.cache.get(prev);
-        const next = clampIndex + offset;
-        if (next <= this.frameCount && this.cache.has(next)) return this.cache.get(next);
-        offset++;
+      // O(1) fallback to the most recent loaded frame
+      if (this.lastReturnedFrame) {
+        return this.lastReturnedFrame;
+      }
+      // Fast nearby search (radius 15)
+      for (let r = 1; r <= 15; r++) {
+        const p = clampIndex - r;
+        if (p >= 1 && this.cache.has(p)) {
+          this.lastReturnedFrame = this.cache.get(p);
+          return this.lastReturnedFrame;
+        }
+        const n = clampIndex + r;
+        if (n <= this.frameCount && this.cache.has(n)) {
+          this.lastReturnedFrame = this.cache.get(n);
+          return this.lastReturnedFrame;
+        }
       }
       return null;
     }
@@ -71,7 +82,7 @@
           if (settled) return;
           settled = true;
           this.cache.set(clampIndex, img);
-          this.loadedIndices.add(clampIndex);
+          if (!this.lastReturnedFrame) this.lastReturnedFrame = img;
           resolve(img);
         };
 
@@ -81,20 +92,13 @@
           resolve(null);
         };
 
-        // Safety timeout so no single frame hangs the pipeline
-        const timer = setTimeout(onError, 3000);
+        const timer = setTimeout(onError, 3500);
 
-        const finish = () => {
+        img.onload = () => {
           clearTimeout(timer);
-          if (typeof img.decode === 'function') {
-            img.decode().then(onDone).catch(onDone);
-          } else {
-            onDone();
-          }
+          onDone();
         };
 
-        // Attach listeners BEFORE assigning src
-        img.onload = finish;
         img.onerror = () => {
           clearTimeout(timer);
           onError();
@@ -102,9 +106,9 @@
 
         img.src = this.getPath(clampIndex);
 
-        // If already cached or complete, finish immediately
         if (img.complete) {
-          finish();
+          clearTimeout(timer);
+          onDone();
         }
       });
     }
@@ -112,65 +116,74 @@
     async preloadInitial() {
       const target = Math.min(this.initialPreloadTarget, this.frameCount);
       if (target <= 0) {
-        if (this.onInitialLoadComplete) this.onInitialLoadComplete();
+        if (this.onInitialComplete) this.onInitialComplete();
         return;
       }
 
-      let loadedCount = 0;
-      const onFrameLoaded = () => {
-        loadedCount++;
-        if (this.onInitialLoadProgress) {
-          this.onInitialLoadProgress(loadedCount, target);
+      let loaded = 0;
+      const onProgress = () => {
+        loaded++;
+        if (this.onInitialProgress) {
+          this.onInitialProgress(loaded, target);
         }
       };
 
-      // Preload initial frames in parallel
-      const framePromises = [];
+      const promises = [];
       for (let i = 1; i <= target; i++) {
-        framePromises.push(this.loadSingleFrame(i).then(onFrameLoaded));
+        promises.push(this.loadSingleFrame(i).then(onProgress));
       }
 
-      // Hard safety timeout: Never freeze the site for more than 3.5 seconds
-      const safetyTimeout = new Promise((resolve) => setTimeout(resolve, 3500));
+      // 3.5s maximum timeout so preloader never blocks the site
+      const timeout = new Promise((res) => setTimeout(res, 3500));
+      await Promise.race([Promise.all(promises), timeout]);
 
-      await Promise.race([
-        Promise.all(framePromises),
-        safetyTimeout
-      ]);
-
-      if (this.onInitialLoadComplete) {
-        this.onInitialLoadComplete();
+      if (this.onInitialComplete) {
+        this.onInitialComplete();
       }
+    }
+
+    // Directional streaming: preloads frames near current user position
+    prioritize(currentIndex) {
+      const lookahead = 25;
+      const lookbehind = 10;
+      const start = Math.max(1, currentIndex - lookbehind);
+      const end = Math.min(this.frameCount, currentIndex + lookahead);
+
+      for (let i = start; i <= end; i++) {
+        if (!this.cache.has(i) && !this.pendingQueue.includes(i)) {
+          this.pendingQueue.unshift(i);
+        }
+      }
+      this.pumpQueue();
     }
 
     startBackgroundStreaming(fromIndex = 1) {
       if (this.isStreaming) return;
       this.isStreaming = true;
 
-      // Fill load queue for remaining frames in sequential order
       for (let i = fromIndex; i <= this.frameCount; i++) {
         if (!this.cache.has(i)) {
-          this.loadQueue.push(i);
+          this.pendingQueue.push(i);
         }
       }
+      this.pumpQueue();
+    }
 
-      const streamNext = async () => {
-        if (this.loadQueue.length === 0) {
-          this.isStreaming = false;
-          return;
-        }
-        const nextIndex = this.loadQueue.shift();
-        await this.loadSingleFrame(nextIndex);
-        
-        // Yield to browser main thread
-        if ('requestIdleCallback' in window) {
-          window.requestIdleCallback(streamNext, { timeout: 80 });
-        } else {
-          setTimeout(streamNext, 16);
-        }
-      };
+    pumpQueue() {
+      while (this.activeRequests < this.maxConcurrent && this.pendingQueue.length > 0) {
+        const nextIdx = this.pendingQueue.shift();
+        if (this.cache.has(nextIdx)) continue;
 
-      streamNext();
+        this.activeRequests++;
+        this.loadSingleFrame(nextIdx).finally(() => {
+          this.activeRequests--;
+          if ('requestIdleCallback' in window) {
+            window.requestIdleCallback(() => this.pumpQueue(), { timeout: 100 });
+          } else {
+            setTimeout(() => this.pumpQueue(), 16);
+          }
+        });
+      }
     }
 
     handleResize() {
@@ -178,172 +191,133 @@
       if (newIsMobile !== this.isMobile) {
         this.isMobile = newIsMobile;
         this.cache.clear();
-        this.loadedIndices.clear();
+        this.lastReturnedFrame = null;
         this.preloadInitial();
       }
     }
   }
 
   /* ==========================================================================
-     2. GLOBAL FILM-GRAIN OVERLAY
-     Offscreen noise tile shifted ~8 times per second, 3.5% opacity, no vignette.
+     2. GLOBAL ACCELERATED SYSTEMS (Film Grain, Cursor, Navigation)
      ========================================================================== */
-  function initFilmGrain() {
+  function setupFilmGrain() {
     const canvas = document.getElementById('film-grain');
     if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    const tileSize = CFG.hardware.noiseTileSize;
 
-    // Create offscreen noise pattern
+    const tileSize = CFG.hardware.noiseTileSize || 128;
     const offscreen = document.createElement('canvas');
     offscreen.width = tileSize;
     offscreen.height = tileSize;
     const offCtx = offscreen.getContext('2d');
     const imgData = offCtx.createImageData(tileSize, tileSize);
-    const buffer = new Uint32Array(imgData.data.buffer);
+    const buf = new Uint32Array(imgData.data.buffer);
 
-    for (let i = 0; i < buffer.length; i++) {
+    for (let i = 0; i < buf.length; i++) {
       const shade = (Math.random() * 255) | 0;
-      // RGBA in 32-bit: (alpha << 24) | (blue << 16) | (green << 8) | red
-      buffer[i] = (255 << 24) | (shade << 16) | (shade << 8) | shade;
+      buf[i] = (255 << 24) | (shade << 16) | (shade << 8) | shade;
     }
     offCtx.putImageData(imgData, 0, 0);
 
-    let pattern;
+    const ctx = canvas.getContext('2d');
     const resizeGrain = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
-      pattern = ctx.createPattern(offscreen, 'repeat');
+      canvas.width = window.innerWidth + tileSize;
+      canvas.height = window.innerHeight + tileSize;
+      const pattern = ctx.createPattern(offscreen, 'repeat');
+      ctx.fillStyle = pattern;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
     };
     resizeGrain();
     window.addEventListener('resize', resizeGrain, { passive: true });
 
-    let lastTime = 0;
-    const interval = 1000 / CFG.hardware.noiseFps;
+    let lastGrain = 0;
+    const grainInterval = 1000 / (CFG.hardware.noiseFps || 8);
 
-    function renderGrain(timestamp) {
-      if (timestamp - lastTime >= interval) {
-        lastTime = timestamp;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.save();
-        // Shift pattern randomly
+    return function updateGrain(timestamp) {
+      if (timestamp - lastGrain >= grainInterval) {
+        lastGrain = timestamp;
         const shiftX = (Math.random() * tileSize) | 0;
         const shiftY = (Math.random() * tileSize) | 0;
-        ctx.translate(shiftX, shiftY);
-        ctx.fillStyle = pattern;
-        ctx.fillRect(-shiftX, -shiftY, canvas.width + tileSize, canvas.height + tileSize);
-        ctx.restore();
+        canvas.style.transform = `translate3d(-${shiftX}px, -${shiftY}px, 0)`;
       }
-      requestAnimationFrame(renderGrain);
-    }
-    requestAnimationFrame(renderGrain);
+    };
   }
 
-  /* ==========================================================================
-     3. CUSTOM HEADLIGHT CURSOR
-     6px dot inside 28px ring (1px stroke), follows mouse with lerp 0.18.
-     Morphs into 44x2px light bar with mono label over interactive targets.
-     Mousedown triggers 120ms white flash.
-     ========================================================================== */
-  function initCustomCursor() {
+  function setupCursor() {
     if (!window.matchMedia('(pointer: fine)').matches || prefersReducedMotion) {
-      return;
+      return () => {};
     }
 
     const cursorEl = document.getElementById('cursor');
-    if (!cursorEl) return;
+    if (!cursorEl) return () => {};
     const labelEl = cursorEl.querySelector('.cursor-label');
 
     let mouseX = window.innerWidth / 2;
     let mouseY = window.innerHeight / 2;
-    let currentX = mouseX;
-    let currentY = mouseY;
-    let isHovering = false;
-    let currentLabel = '';
+    let curX = mouseX;
+    let curY = mouseY;
 
     window.addEventListener('mousemove', (e) => {
       mouseX = e.clientX;
       mouseY = e.clientY;
     }, { passive: true });
 
-    // Click flash effect (120ms pure white)
     window.addEventListener('mousedown', () => {
       cursorEl.classList.add('is-active');
-      setTimeout(() => {
-        cursorEl.classList.remove('is-active');
-      }, 120);
+      setTimeout(() => cursorEl.classList.remove('is-active'), 120);
     });
 
-    // Update cursor target on hover
-    function bindCursorInteractions() {
-      const targets = document.querySelectorAll('a, button, [data-cursor-label], .lineup-slide');
-      targets.forEach((el) => {
-        el.addEventListener('mouseenter', () => {
-          isHovering = true;
-          currentLabel = el.getAttribute('data-cursor-label') || 'VIEW';
-          labelEl.textContent = currentLabel;
-          cursorEl.classList.add('is-hovering');
-        });
-
-        el.addEventListener('mouseleave', () => {
-          isHovering = false;
-          cursorEl.classList.remove('is-hovering');
-          labelEl.textContent = '';
-        });
+    document.querySelectorAll('a, button, [data-cursor-label]').forEach((el) => {
+      el.addEventListener('mouseenter', () => {
+        const text = el.getAttribute('data-cursor-label') || 'VIEW';
+        if (labelEl) labelEl.textContent = text;
+        cursorEl.classList.add('is-hovering');
       });
-    }
-    bindCursorInteractions();
+      el.addEventListener('mouseleave', () => {
+        cursorEl.classList.remove('is-hovering');
+        if (labelEl) labelEl.textContent = '';
+      });
+    });
 
-    // Lerp animation loop
-    function updateCursor() {
-      const lerp = CFG.hardware.cursorLerp;
-      currentX += (mouseX - currentX) * lerp;
-      currentY += (mouseY - currentY) * lerp;
-      cursorEl.style.transform = `translate3d(${currentX}px, ${currentY}px, 0)`;
-      requestAnimationFrame(updateCursor);
-    }
-    requestAnimationFrame(updateCursor);
-
-    // Expose method to dynamically update cursor label
     window.__setCursorLabel = function (text) {
-      if (labelEl) {
-        labelEl.textContent = text;
+      if (labelEl) labelEl.textContent = text;
+    };
+
+    const lerp = CFG.hardware.cursorLerp || 0.18;
+    return function updateCursor() {
+      curX += (mouseX - curX) * lerp;
+      curY += (mouseY - curY) * lerp;
+      cursorEl.style.transform = `translate3d(${curX}px, ${curY}px, 0)`;
+    };
+  }
+
+  function setupNav() {
+    const nav = document.getElementById('main-nav');
+    if (!nav) return () => {};
+    let lastY = 0;
+
+    return function updateNav(scrollY) {
+      if (scrollY > lastY && scrollY > 120) {
+        nav.classList.add('is-hidden');
+      } else if (scrollY < lastY) {
+        nav.classList.remove('is-hidden');
       }
+      lastY = scrollY;
     };
   }
 
   /* ==========================================================================
-     4. NAVBAR SCROLL DIRECTION DETECTION
-     Transparent, mix-blend-mode: difference. Hides on scroll down, shows on up.
+     3. HERO CONTROLLER
+     Zero forced reflow during render, sub-pixel canvas drawing.
      ========================================================================== */
-  function initNav() {
-    const nav = document.getElementById('main-nav');
-    if (!nav) return;
-    let lastScrollY = window.scrollY;
-
-    window.addEventListener('scroll', () => {
-      const currentScrollY = window.scrollY;
-      if (currentScrollY > lastScrollY && currentScrollY > 120) {
-        nav.classList.add('is-hidden');
-      } else {
-        nav.classList.remove('is-hidden');
-      }
-      lastScrollY = currentScrollY;
-    }, { passive: true });
-  }
-
-  /* ==========================================================================
-     5. HERO PINNED SCROLLYTELLING ENGINE
-     Full-screen canvas scrubbing 718 joined hero frames.
-     HUD telemetry, sky chapter reveals, 1px bottom progress line,
-     canvas fade to solid black over the final 5% (0.95–1.00).
-     ========================================================================== */
-  function initHeroScrolly(heroSequence) {
+  function setupHero(heroSequence) {
     const wrapper = document.getElementById('hero');
     const canvas = document.getElementById('hero-canvas');
-    if (!wrapper || !canvas) return;
+    if (!wrapper || !canvas) return () => {};
 
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'medium';
+
     const progressBar = document.getElementById('hero-progress-bar');
     const hudChapterText = document.getElementById('hud-chapter-text');
     const hudSpeedVal = document.getElementById('hud-speed-val');
@@ -354,229 +328,180 @@
       element: document.getElementById(ch.id)
     }));
 
-    let currentFrame = 1;
-    let targetFrame = 1;
-    let targetProgress = 0;
-    let currentProgress = 0;
-    let lastDrawnFrame = -1;
-    let lastRenderedProgress = -1;
-
-    let canvasWidth = 0;
-    let canvasHeight = 0;
     let dpr = 1;
+    let canvasW = 0;
+    let canvasH = 0;
+    let wrapperTop = 0;
+    let wrapperH = 0;
+    let lastActiveChapter = null;
 
-    function resizeCanvas() {
+    function resize() {
       dpr = Math.min(window.devicePixelRatio || 1, CFG.hardware.maxDevicePixelRatio);
-      canvasWidth = window.innerWidth;
-      canvasHeight = window.innerHeight;
-      canvas.width = canvasWidth * dpr;
-      canvas.height = canvasHeight * dpr;
+      canvasW = window.innerWidth;
+      canvasH = window.innerHeight;
+      canvas.width = canvasW * dpr;
+      canvas.height = canvasH * dpr;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      lastDrawnFrame = -1; // Force immediate redraw
+
+      // Cache layout positions
+      wrapperTop = wrapper.offsetTop;
+      wrapperH = wrapper.offsetHeight;
+      lastDrawn = -1;
     }
-    resizeCanvas();
-    window.addEventListener('resize', resizeCanvas, { passive: true });
+    resize();
+    window.addEventListener('resize', resize, { passive: true });
 
-    function renderCanvas(frameNum, progress) {
-      ctx.fillStyle = '#07080A'; // --asphalt
-      ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+    let currentFrame = 1;
+    let lastDrawn = -1;
+    let lastProgress = -1;
 
+    function draw(frameNum, progress) {
       const img = heroSequence.getFrame(frameNum);
+      const isPortrait = canvasH > canvasW;
+
       if (img && img.naturalWidth) {
-        const isPortrait = canvasHeight > canvasWidth;
         const imgW = img.naturalWidth;
         const imgH = img.naturalHeight;
 
-        let drawW, drawH, drawX, drawY;
-
         if (isPortrait) {
-          // Contain-fit vertically centered on portrait screens
-          const scale = Math.min(canvasWidth / imgW, canvasHeight / imgH);
-          drawW = imgW * scale;
-          drawH = imgH * scale;
-          drawX = (canvasWidth - drawW) / 2;
-          drawY = (canvasHeight - drawH) / 2;
+          ctx.fillStyle = '#07080A';
+          ctx.fillRect(0, 0, canvasW, canvasH);
+          const scale = Math.min(canvasW / imgW, canvasH / imgH);
+          const dw = imgW * scale;
+          const dh = imgH * scale;
+          ctx.drawImage(img, (canvasW - dw) / 2, (canvasH - dh) / 2, dw, dh);
         } else {
-          // Cover-fit on landscape screens
-          const scale = Math.max(canvasWidth / imgW, canvasHeight / imgH);
-          drawW = imgW * scale;
-          drawH = imgH * scale;
-          drawX = (canvasWidth - drawW) / 2;
-          drawY = (canvasHeight - drawH) / 2;
+          const scale = Math.max(canvasW / imgW, canvasH / imgH);
+          const dw = imgW * scale;
+          const dh = imgH * scale;
+          ctx.drawImage(img, (canvasW - dw) / 2, (canvasH - dh) / 2, dw, dh);
         }
-
-        ctx.drawImage(img, drawX, drawY, drawW, drawH);
+      } else {
+        ctx.fillStyle = '#07080A';
+        ctx.fillRect(0, 0, canvasW, canvasH);
       }
 
-      // Over the last 5% of scroll (0.95 -> 1.00), fade canvas to solid black/asphalt
+      // Smooth fade to black over final 5%
       if (progress >= CFG.hero.fadeToBlackStart) {
-        const fadeAlpha = Math.min((progress - CFG.hero.fadeToBlackStart) / (1 - CFG.hero.fadeToBlackStart), 1);
-        ctx.fillStyle = `rgba(7, 8, 10, ${fadeAlpha})`;
-        ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+        const fade = Math.min((progress - CFG.hero.fadeToBlackStart) / (1 - CFG.hero.fadeToBlackStart), 1);
+        ctx.fillStyle = `rgba(7, 8, 10, ${fade})`;
+        ctx.fillRect(0, 0, canvasW, canvasH);
       }
     }
 
-    function updateChapters(progress) {
-      chapters.forEach((ch) => {
-        if (!ch.element) return;
-        const isActive = progress >= ch.start && progress <= ch.end;
-        if (isActive && !ch.element.classList.contains('is-active')) {
-          ch.element.classList.add('is-active');
-          ch.element.classList.add('is-revealed');
-        } else if (!isActive && ch.element.classList.contains('is-active')) {
-          ch.element.classList.remove('is-active');
-        }
-      });
+    return function updateHero(scrollY, windowH) {
+      const maxScroll = wrapperH - windowH;
+      if (maxScroll <= 0) return;
 
-      // Update active HUD chapter tick & label
-      const activeCh = chapters.find(ch => progress >= ch.start && progress <= ch.end) || chapters[0];
-      if (hudChapterText && activeCh.hudChapter) {
-        hudChapterText.textContent = activeCh.hudChapter;
-      }
+      // Pure arithmetic — zero getBoundingClientRect calls!
+      const targetProgress = Math.min(Math.max((scrollY - wrapperTop) / maxScroll, 0), 1);
+      const targetFrame = Math.round(targetProgress * (CFG.hero.frameCount - 1)) + 1;
 
-      // Update speed & distance telemetry
-      if (hudSpeedVal) {
-        const speed = Math.round(progress * CFG.hero.telemetry.speedMax);
-        hudSpeedVal.textContent = String(speed).padStart(3, '0');
-      }
-      if (hudDistVal) {
-        const dist = (progress * CFG.hero.telemetry.distanceMax).toFixed(1);
-        hudDistVal.textContent = dist;
-      }
-    }
-
-    function scrollyLoop() {
-      // Calculate scroll progress relative to wrapper height
-      const rect = wrapper.getBoundingClientRect();
-      const maxScroll = wrapper.offsetHeight - window.innerHeight;
-      targetProgress = maxScroll > 0 ? Math.min(Math.max(-rect.top / maxScroll, 0), 1) : 0;
-      targetFrame = Math.round(targetProgress * (CFG.hero.frameCount - 1)) + 1;
-
-      // Lerp smoothing
       currentFrame += (targetFrame - currentFrame) * CFG.hero.lerpFactor;
-      currentProgress += (targetProgress - currentProgress) * CFG.hero.lerpFactor;
+      const rounded = Math.round(currentFrame);
 
-      const roundedFrame = Math.round(currentFrame);
-
-      // Redraw only when the rounded frame or fade progress changes
-      if (roundedFrame !== lastDrawnFrame || Math.abs(currentProgress - lastRenderedProgress) > 0.002) {
-        renderCanvas(roundedFrame, currentProgress);
-        lastDrawnFrame = roundedFrame;
-        lastRenderedProgress = currentProgress;
+      // Redraw only when needed
+      if (rounded !== lastDrawn || Math.abs(targetProgress - lastProgress) > 0.003) {
+        draw(rounded, targetProgress);
+        lastDrawn = rounded;
+        lastProgress = targetProgress;
+        heroSequence.prioritize(rounded);
       }
 
-      // Update bottom progress bar (1px xenon line)
       if (progressBar) {
         progressBar.style.width = `${(targetProgress * 100).toFixed(2)}%`;
       }
 
-      updateChapters(targetProgress);
+      // HUD and Chapter updates
+      const activeCh = chapters.find(ch => targetProgress >= ch.start && targetProgress <= ch.end) || chapters[0];
+      if (activeCh !== lastActiveChapter) {
+        lastActiveChapter = activeCh;
+        chapters.forEach(ch => {
+          if (!ch.element) return;
+          const active = ch === activeCh;
+          ch.element.classList.toggle('is-active', active);
+          if (active) ch.element.classList.add('is-revealed');
+        });
+        if (hudChapterText) hudChapterText.textContent = activeCh.hudChapter;
+      }
 
-      requestAnimationFrame(scrollyLoop);
-    }
-
-    requestAnimationFrame(scrollyLoop);
+      if (hudSpeedVal) {
+        const speed = Math.round(targetProgress * CFG.hero.telemetry.speedMax);
+        hudSpeedVal.textContent = String(speed).padStart(3, '0');
+      }
+      if (hudDistVal) {
+        hudDistVal.textContent = (targetProgress * CFG.hero.telemetry.distanceMax).toFixed(1);
+      }
+    };
   }
 
   /* ==========================================================================
-     6. SECTION 2: STATEMENT SCROLL REVEAL
-     Sentence reveals word-by-word with scroll (15% -> 100% opacity).
+     4. STATEMENT CONTROLLER
      ========================================================================== */
-  function initStatementReveal() {
+  function setupStatement() {
     const section = document.getElementById('statement');
     const quote = document.getElementById('statement-quote');
-    if (!section || !quote) return;
+    if (!section || !quote) return () => {};
 
     const words = quote.querySelectorAll('.word');
+    let sectionTop = 0;
+    let sectionH = 0;
 
-    function updateStatement() {
-      const rect = section.getBoundingClientRect();
-      const windowH = window.innerHeight;
-      // Start reveal when section is halfway up the screen, finish when centered
-      const start = windowH * 0.85;
-      const end = windowH * 0.20;
-      const progress = Math.min(Math.max((start - rect.top) / (start - end), 0), 1);
-
-      const totalWords = words.length;
-      words.forEach((word, index) => {
-        const wordStart = index / totalWords;
-        const wordEnd = (index + 1) / totalWords;
-        let wordProgress = 0;
-        if (progress > wordStart) {
-          wordProgress = Math.min((progress - wordStart) / (wordEnd - wordStart), 1);
-        }
-        const opacity = 0.15 + 0.85 * wordProgress;
-        word.style.opacity = opacity;
-        word.style.color = wordProgress >= 0.95 ? 'var(--bone)' : 'var(--fog)';
-      });
+    function resize() {
+      sectionTop = section.offsetTop;
+      sectionH = section.offsetHeight;
     }
+    resize();
+    window.addEventListener('resize', resize, { passive: true });
 
-    window.addEventListener('scroll', updateStatement, { passive: true });
-    updateStatement();
+    return function updateStatement(scrollY, windowH) {
+      if (scrollY + windowH < sectionTop || scrollY > sectionTop + sectionH) return;
+
+      const start = sectionTop - windowH * 0.85;
+      const end = sectionTop - windowH * 0.20;
+      const progress = Math.min(Math.max((scrollY - start) / (end - start), 0), 1);
+
+      const total = words.length;
+      words.forEach((w, i) => {
+        const wStart = i / total;
+        const wEnd = (i + 1) / total;
+        let wp = 0;
+        if (progress > wStart) {
+          wp = Math.min((progress - wStart) / (wEnd - wStart), 1);
+        }
+        w.style.opacity = (0.15 + 0.85 * wp).toFixed(2);
+        w.style.color = wp >= 0.95 ? 'var(--bone)' : 'var(--fog)';
+      });
+    };
   }
 
   /* ==========================================================================
-     7. SECTION 3: DISMANTLE PINNED SCROLLYTELLING & VECTOR CALLOUTS
-     Scrubbing 240 dismantle frames. After 70% progress, 4 callouts fade in.
-     Each callout has a small xenon dot on the car part, connected by a 1px
-     hairline to a mono label + body text.
+     5. DISMANTLE CONTROLLER
      ========================================================================== */
-  function initDismantleScrolly(dismantleSequence) {
+  function setupDismantle(dismantleSequence) {
     const wrapper = document.getElementById('dismantle');
     const canvas = document.getElementById('dismantle-canvas');
     const calloutsLayer = document.getElementById('dismantle-callouts-layer');
     const progressBar = document.getElementById('dismantle-progress-bar');
-    if (!wrapper || !canvas || !calloutsLayer) return;
+    if (!wrapper || !canvas || !calloutsLayer) return () => {};
 
-    const ctx = canvas.getContext('2d');
-    let canvasWidth = 0;
-    let canvasHeight = 0;
+    const ctx = canvas.getContext('2d', { alpha: false });
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'medium';
+
     let dpr = 1;
-
-    let currentFrame = 1;
-    let targetFrame = 1;
-    let targetProgress = 0;
-    let lastDrawnFrame = -1;
-
-    // Track car drawing boundaries for coordinate anchoring
+    let canvasW = 0;
+    let canvasH = 0;
+    let wrapperTop = 0;
+    let wrapperH = 0;
     let carBounds = { x: 0, y: 0, width: 0, height: 0 };
-    let calloutElements = [];
 
-    function updateCalloutPositions() {
-      if (!calloutElements || calloutElements.length === 0) return;
-      const stageW = canvasWidth;
-      const stageH = canvasHeight;
-
-      calloutElements.forEach((item) => {
-        const c = item.config;
-        // Anchor dot on the car part using natural car frame coordinates
-        const dotX = carBounds.x + (c.dotX / 100) * carBounds.width;
-        const dotY = carBounds.y + (c.dotY / 100) * carBounds.height;
-
-        // Label position
-        const labelX = (c.labelX / 100) * stageW;
-        const labelY = (c.labelY / 100) * stageH;
-
-        item.dot.setAttribute('cx', dotX);
-        item.dot.setAttribute('cy', dotY);
-
-        item.line.setAttribute('x1', dotX);
-        item.line.setAttribute('y1', dotY);
-        item.line.setAttribute('x2', labelX);
-        item.line.setAttribute('y2', labelY);
-
-        item.card.style.left = `${labelX}px`;
-        item.card.style.top = `${labelY}px`;
-      });
-    }
-
-    // Build callout elements in the DOM
+    // Build callouts DOM
     calloutsLayer.innerHTML = '';
-    calloutElements = CFG.dismantle.callouts.map((c) => {
+    const calloutItems = CFG.dismantle.callouts.map((c) => {
       const container = document.createElement('div');
       container.className = 'callout-item';
       container.id = `callout-${c.id}`;
-
       container.innerHTML = `
         <svg class="callout-svg">
           <line class="callout-line" x1="0" y1="0" x2="0" y2="0"></line>
@@ -587,157 +512,164 @@
           <span class="callout-desc">${c.text}</span>
         </div>
       `;
-
       calloutsLayer.appendChild(container);
       return {
         config: c,
-        container: container,
+        container,
         line: container.querySelector('.callout-line'),
         dot: container.querySelector('.callout-dot'),
         card: container.querySelector('.callout-card')
       };
     });
 
-    function resizeCanvas() {
-      dpr = Math.min(window.devicePixelRatio || 1, CFG.hardware.maxDevicePixelRatio);
-      canvasWidth = window.innerWidth;
-      canvasHeight = window.innerHeight;
-      canvas.width = canvasWidth * dpr;
-      canvas.height = canvasHeight * dpr;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      lastDrawnFrame = -1;
-      updateCalloutPositions();
-    }
-    resizeCanvas();
-    window.addEventListener('resize', resizeCanvas, { passive: true });
+    function updateCallouts() {
+      calloutItems.forEach((item) => {
+        const c = item.config;
+        const dotX = carBounds.x + (c.dotX / 100) * carBounds.width;
+        const dotY = carBounds.y + (c.dotY / 100) * carBounds.height;
+        const labelX = (c.labelX / 100) * canvasW;
+        const labelY = (c.labelY / 100) * canvasH;
 
-    function renderCanvas(frameNum) {
+        item.dot.setAttribute('cx', dotX);
+        item.dot.setAttribute('cy', dotY);
+        item.line.setAttribute('x1', dotX);
+        item.line.setAttribute('y1', dotY);
+        item.line.setAttribute('x2', labelX);
+        item.line.setAttribute('y2', labelY);
+        item.card.style.left = `${labelX}px`;
+        item.card.style.top = `${labelY}px`;
+      });
+    }
+
+    function resize() {
+      dpr = Math.min(window.devicePixelRatio || 1, CFG.hardware.maxDevicePixelRatio);
+      canvasW = window.innerWidth;
+      canvasH = window.innerHeight;
+      canvas.width = canvasW * dpr;
+      canvas.height = canvasH * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      wrapperTop = wrapper.offsetTop;
+      wrapperH = wrapper.offsetHeight;
+      lastDrawn = -1;
+      updateCallouts();
+    }
+    resize();
+    window.addEventListener('resize', resize, { passive: true });
+
+    let currentFrame = 1;
+    let lastDrawn = -1;
+
+    function draw(frameNum) {
       ctx.fillStyle = '#07080A';
-      ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+      ctx.fillRect(0, 0, canvasW, canvasH);
 
       const img = dismantleSequence.getFrame(frameNum);
       if (img && img.naturalWidth) {
-        const isPortrait = canvasHeight > canvasWidth;
+        const isPortrait = canvasH > canvasW;
         const imgW = img.naturalWidth;
         const imgH = img.naturalHeight;
-
-        let drawW, drawH, drawX, drawY;
+        let dw, dh, dx, dy;
 
         if (isPortrait) {
-          const scale = Math.min(canvasWidth / imgW, canvasHeight / imgH);
-          drawW = imgW * scale;
-          drawH = imgH * scale;
-          drawX = (canvasWidth - drawW) / 2;
-          drawY = (canvasHeight - drawH) / 2;
+          const scale = Math.min(canvasW / imgW, canvasH / imgH);
+          dw = imgW * scale;
+          dh = imgH * scale;
+          dx = (canvasW - dw) / 2;
+          dy = (canvasH - dh) / 2;
         } else {
-          const scale = Math.max(canvasWidth / imgW, canvasHeight / imgH);
-          drawW = imgW * scale;
-          drawH = imgH * scale;
-          drawX = (canvasWidth - drawW) / 2;
-          drawY = (canvasHeight - drawH) / 2;
+          const scale = Math.max(canvasW / imgW, canvasH / imgH);
+          dw = imgW * scale;
+          dh = imgH * scale;
+          dx = (canvasW - dw) / 2;
+          dy = (canvasH - dh) / 2;
         }
 
-        ctx.drawImage(img, drawX, drawY, drawW, drawH);
-
-        carBounds = { x: drawX, y: drawY, width: drawW, height: drawH };
-        updateCalloutPositions();
+        ctx.drawImage(img, dx, dy, dw, dh);
+        carBounds = { x: dx, y: dy, width: dw, height: dh };
+        updateCallouts();
       }
     }
 
-    function scrollyLoop() {
-      const rect = wrapper.getBoundingClientRect();
-      const maxScroll = wrapper.offsetHeight - window.innerHeight;
-      targetProgress = maxScroll > 0 ? Math.min(Math.max(-rect.top / maxScroll, 0), 1) : 0;
-      targetFrame = Math.round(targetProgress * (CFG.dismantle.frameCount - 1)) + 1;
+    return function updateDismantle(scrollY, windowH) {
+      if (scrollY + windowH < wrapperTop || scrollY > wrapperTop + wrapperH) return;
+
+      const maxScroll = wrapperH - windowH;
+      if (maxScroll <= 0) return;
+
+      const targetProgress = Math.min(Math.max((scrollY - wrapperTop) / maxScroll, 0), 1);
+      const targetFrame = Math.round(targetProgress * (CFG.dismantle.frameCount - 1)) + 1;
 
       currentFrame += (targetFrame - currentFrame) * CFG.dismantle.lerpFactor;
-      const roundedFrame = Math.round(currentFrame);
+      const rounded = Math.round(currentFrame);
 
-      if (roundedFrame !== lastDrawnFrame) {
-        renderCanvas(roundedFrame);
-        lastDrawnFrame = roundedFrame;
+      if (rounded !== lastDrawn) {
+        draw(rounded);
+        lastDrawn = rounded;
+        dismantleSequence.prioritize(rounded);
       }
 
       if (progressBar) {
         progressBar.style.width = `${(targetProgress * 100).toFixed(2)}%`;
       }
 
-      // Reveal callouts sequentially after 70% progress
-      calloutElements.forEach((item) => {
-        const shouldShow = targetProgress >= item.config.threshold;
-        if (shouldShow && !item.container.classList.contains('is-visible')) {
-          item.container.classList.add('is-visible');
-        } else if (!shouldShow && item.container.classList.contains('is-visible')) {
-          item.container.classList.remove('is-visible');
-        }
+      calloutItems.forEach((item) => {
+        const show = targetProgress >= item.config.threshold;
+        item.container.classList.toggle('is-visible', show);
       });
-
-      requestAnimationFrame(scrollyLoop);
-    }
-
-    requestAnimationFrame(scrollyLoop);
+    };
   }
 
   /* ==========================================================================
-     8. SECTION 4: LINEUP ACCORDION (Desktop Flex-Grow & Mobile Stacks)
-     5 slides side by side. GT-E open by default.
-     Debounced hover (80ms), keyboard accessibility (arrow keys),
-     slide entrance reveal on viewport entry.
+     6. LINEUP ACCORDION (Desktop Flex-Grow & Mobile Stacks)
      ========================================================================== */
-  function initLineupAccordion() {
+  function setupLineup() {
     const section = document.getElementById('lineup');
     const container = document.getElementById('lineup-accordion');
-    const header = section.querySelector('.lineup-top-header');
+    const header = section ? section.querySelector('.lineup-top-header') : null;
     if (!section || !container) return;
 
-    // IntersectionObserver for entrance stagger
-    const observer = new IntersectionObserver((entries) => {
-      entries.forEach((entry) => {
-        if (entry.isIntersecting) {
+    // Fast reveal on intersection
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach((e) => {
+        if (e.isIntersecting) {
           section.classList.add('is-revealed');
           if (header) header.classList.add('is-revealed');
-          observer.unobserve(section);
+          obs.unobserve(section);
         }
       });
-    }, { threshold: 0.15 });
-    observer.observe(section);
+    }, { threshold: 0.1 });
+    obs.observe(section);
 
     container.innerHTML = '';
     const cars = CFG.lineup.cars;
 
     cars.forEach((car, index) => {
-      const isDefaultOpen = index === 0;
+      const isOpen = index === 0;
       const slide = document.createElement('div');
-      slide.className = `lineup-slide ${isDefaultOpen ? 'is-open' : ''}`;
-      slide.id = `lineup-slide-${car.id}`;
+      slide.className = `lineup-slide ${isOpen ? 'is-open' : ''}`;
       slide.setAttribute('role', 'button');
       slide.setAttribute('tabindex', '0');
-      slide.setAttribute('aria-expanded', isDefaultOpen ? 'true' : 'false');
+      slide.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
       slide.setAttribute('aria-label', `Model ${car.name}`);
-      slide.setAttribute('data-cursor-label', isDefaultOpen ? 'CONFIGURE' : 'OPEN');
+      slide.setAttribute('data-cursor-label', isOpen ? 'CONFIGURE' : 'OPEN');
 
       slide.innerHTML = `
-        <!-- Closed Visual & Labels -->
         <img class="slide-bg-thumb" src="${car.image}" alt="${car.alt}" loading="lazy" />
         <div class="slide-closed-view" aria-hidden="true">
           <span class="closed-num mono-hud">${car.number}</span>
           <span class="closed-name mono-hud">${car.name}</span>
         </div>
-
-        <!-- Open View Details -->
         <div class="open-car-container" aria-hidden="true">
           <img class="open-car-img" src="${car.image}" alt="${car.alt}" loading="lazy" />
         </div>
-
         <div class="slide-open-view">
           <div class="open-header">
             <span class="open-number mono-hud">${car.number} — MODEL</span>
             <h3 class="open-model-name display-title">${car.name}</h3>
           </div>
-
           <div class="open-footer">
             <p class="open-tagline">${car.tagline}</p>
-            
             <div class="open-specs-row mono-hud">
               ${car.specs.map(s => `
                 <div class="spec-col">
@@ -746,170 +678,142 @@
                 </div>
               `).join('')}
             </div>
-
             <div class="open-controls-row">
               <div class="swatches-row" role="group" aria-label="Color Palette">
                 ${car.colors.map((c, i) => `
                   <button type="button" class="color-swatch ${i === 0 ? 'is-active' : ''}" 
                           style="background-color: ${c.hex};" 
-                          aria-label="${c.name}" 
                           title="${c.name}"
-                          data-color="${c.name}">
+                          aria-label="${c.name}">
                   </button>
                 `).join('')}
               </div>
-
               <a href="#reserve" class="configure-link mono-hud" data-cursor-label="CONFIGURE">Configure →</a>
             </div>
           </div>
         </div>
       `;
-
       container.appendChild(slide);
     });
 
     const slides = Array.from(container.querySelectorAll('.lineup-slide'));
-    let activeIndex = 0;
-    let hoverTimeout = null;
+    let activeIdx = 0;
+    let hoverTimer = null;
 
-    function openSlide(index) {
-      if (index === activeIndex && slides[index].classList.contains('is-open')) return;
-
+    function open(idx) {
+      if (idx === activeIdx && slides[idx].classList.contains('is-open')) return;
       slides.forEach((s, i) => {
-        if (i === index) {
-          s.classList.add('is-open');
-          s.setAttribute('aria-expanded', 'true');
-          s.setAttribute('data-cursor-label', 'CONFIGURE');
-          if (window.__setCursorLabel) window.__setCursorLabel('CONFIGURE');
-        } else {
-          s.classList.remove('is-open');
-          s.setAttribute('aria-expanded', 'false');
-          s.setAttribute('data-cursor-label', 'OPEN');
-        }
+        const matches = i === idx;
+        s.classList.toggle('is-open', matches);
+        s.setAttribute('aria-expanded', matches ? 'true' : 'false');
+        s.setAttribute('data-cursor-label', matches ? 'CONFIGURE' : 'OPEN');
       });
-      activeIndex = index;
+      activeIdx = idx;
+      if (window.__setCursorLabel) {
+        window.__setCursorLabel('CONFIGURE');
+      }
     }
 
-    // Attach hover with 80ms debounce (desktop) & click/tap
-    slides.forEach((slide, index) => {
-      // Swatch selection click
-      const swatches = slide.querySelectorAll('.color-swatch');
-      swatches.forEach((swatch) => {
+    slides.forEach((s, i) => {
+      s.querySelectorAll('.color-swatch').forEach((swatch) => {
         swatch.addEventListener('click', (e) => {
           e.stopPropagation();
-          swatches.forEach(s => s.classList.remove('is-active'));
+          s.querySelectorAll('.color-swatch').forEach(x => x.classList.remove('is-active'));
           swatch.classList.add('is-active');
         });
       });
 
-      slide.addEventListener('mouseenter', () => {
-        clearTimeout(hoverTimeout);
-        hoverTimeout = setTimeout(() => {
-          openSlide(index);
-        }, CFG.lineup.debounceHoverMs);
+      s.addEventListener('mouseenter', () => {
+        clearTimeout(hoverTimer);
+        hoverTimer = setTimeout(() => open(i), CFG.lineup.debounceHoverMs || 80);
+      });
+      s.addEventListener('mouseleave', () => clearTimeout(hoverTimer));
+      s.addEventListener('click', () => {
+        clearTimeout(hoverTimer);
+        open(i);
       });
 
-      slide.addEventListener('mouseleave', () => {
-        clearTimeout(hoverTimeout);
-      });
-
-      slide.addEventListener('click', () => {
-        clearTimeout(hoverTimeout);
-        openSlide(index);
-      });
-
-      // Keyboard arrow navigation
-      slide.addEventListener('keydown', (e) => {
+      s.addEventListener('keydown', (e) => {
         if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
           e.preventDefault();
-          const next = (index + 1) % slides.length;
-          slides[next].focus();
-          openSlide(next);
+          const nxt = (i + 1) % slides.length;
+          slides[nxt].focus();
+          open(nxt);
         } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
           e.preventDefault();
-          const prev = (index - 1 + slides.length) % slides.length;
-          slides[prev].focus();
-          openSlide(prev);
+          const prv = (i - 1 + slides.length) % slides.length;
+          slides[prv].focus();
+          open(prv);
         } else if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
-          openSlide(index);
+          open(i);
         }
       });
     });
   }
 
   /* ==========================================================================
-     9. PRELOADER & INITIALIZATION ORCHESTRATOR
-     Loads hero frames 1–40, reveals page, then streams rest of hero + dismantle.
+     7. PRELOADER CONTROLLER
      ========================================================================== */
-  function initPreloader(heroSequence, dismantleSequence) {
+  function setupPreloader(heroSequence, dismantleSequence) {
     const preloaderEl = document.getElementById('preloader');
     const barEl = document.getElementById('preloader-bar');
     const counterEl = document.getElementById('preloader-counter');
 
-    let isDismissed = false;
+    let dismissed = false;
 
-    function updatePreloaderDisplay(pct) {
+    function updateDisplay(pct) {
       const clamped = Math.min(Math.max(pct, 0), 100);
       if (barEl) barEl.style.width = `${clamped}%`;
       if (counterEl) counterEl.textContent = String(Math.round(clamped)).padStart(3, '0');
     }
 
-    heroSequence.onInitialLoadProgress = (loaded, total) => {
-      if (isDismissed) return;
-      const pct = (loaded / total) * 100;
-      updatePreloaderDisplay(pct);
+    heroSequence.onInitialProgress = (loaded, total) => {
+      if (dismissed) return;
+      updateDisplay((loaded / total) * 100);
     };
 
-    const dismissPreloader = () => {
-      if (isDismissed) return;
-      isDismissed = true;
+    const dismiss = () => {
+      if (dismissed) return;
+      dismissed = true;
 
-      updatePreloaderDisplay(100);
-
-      // Flash exit highlight on line
+      updateDisplay(100);
       if (barEl) barEl.classList.add('flash-exit');
 
       setTimeout(() => {
         if (preloaderEl) preloaderEl.classList.add('is-finished');
 
-        // Reveal Hero initial elements
         const ch1 = document.getElementById('hero-ch1');
         if (ch1) {
           ch1.classList.add('is-active');
           ch1.classList.add('is-revealed');
         }
 
-        // Start background streaming in order: rest of hero, then dismantle
-        heroSequence.startBackgroundStreaming(CFG.hero.initialPreloadCount + 1);
-        setTimeout(() => {
-          dismantleSequence.startBackgroundStreaming(1);
-        }, 1200);
-      }, 350);
+        // Start throttled directional background streaming
+        heroSequence.startBackgroundStreaming(heroSequence.initialPreloadTarget + 1);
+        setTimeout(() => dismantleSequence.startBackgroundStreaming(1), 1000);
+      }, 300);
     };
 
-    heroSequence.onInitialLoadComplete = dismissPreloader;
-
-    // Hard safety timer: Preloader will never stay stuck for more than 4 seconds
-    setTimeout(dismissPreloader, 4000);
+    heroSequence.onInitialComplete = dismiss;
+    setTimeout(dismiss, 3500); // Failsafe
 
     heroSequence.preloadInitial();
   }
 
   /* ==========================================================================
-     10. MAIN APP BOOTSTRAP
+     8. UNIFIED 60FPS MASTER TICK (Single requestAnimationFrame loop)
      ========================================================================== */
   function initApp() {
     try {
-      // Setup frame sequence instances
-      const heroSequence = new FrameSequence({
+      const heroSequence = new FastFrameSequence({
         frameCount: CFG.hero.frameCount,
         desktopPath: CFG.hero.desktopPath,
         mobilePath: CFG.hero.mobilePath,
         initialPreloadCount: CFG.hero.initialPreloadCount
       });
 
-      const dismantleSequence = new FrameSequence({
+      const dismantleSequence = new FastFrameSequence({
         frameCount: CFG.dismantle.frameCount,
         desktopPath: CFG.dismantle.desktopPath,
         mobilePath: CFG.dismantle.mobilePath,
@@ -921,23 +825,45 @@
         dismantleSequence.handleResize();
       }, { passive: true });
 
-      // Always initialize Preloader FIRST so it starts immediately and can never be blocked
-      initPreloader(heroSequence, dismantleSequence);
+      // Start preloader immediately
+      setupPreloader(heroSequence, dismantleSequence);
 
-      // Initialize Global Systems safely
-      try { initFilmGrain(); } catch (e) { console.error('Film grain init error:', e); }
-      try { initCustomCursor(); } catch (e) { console.error('Cursor init error:', e); }
-      try { initNav(); } catch (e) { console.error('Nav init error:', e); }
+      // Setup controllers
+      const updateGrain = setupFilmGrain();
+      const updateCursor = setupCursor();
+      const updateNav = setupNav();
+      const updateHero = setupHero(heroSequence);
+      const updateStatement = setupStatement();
+      const updateDismantle = setupDismantle(dismantleSequence);
+      setupLineup();
 
-      // Initialize Interactive Sections safely
-      try { initHeroScrolly(heroSequence); } catch (e) { console.error('Hero scrolly error:', e); }
-      try { initStatementReveal(); } catch (e) { console.error('Statement error:', e); }
-      try { initDismantleScrolly(dismantleSequence); } catch (e) { console.error('Dismantle error:', e); }
-      try { initLineupAccordion(); } catch (e) { console.error('Lineup error:', e); }
+      // Master Tick Loop — locked 60fps with zero layout thrashing
+      let lastScrollY = window.scrollY;
+      let windowH = window.innerHeight;
 
-    } catch (globalErr) {
-      console.error('Fatal initialization error:', globalErr);
-      // Hard fallback: hide preloader so user is NEVER trapped
+      window.addEventListener('resize', () => {
+        windowH = window.innerHeight;
+      }, { passive: true });
+
+      function masterTick(timestamp) {
+        const scrollY = window.scrollY;
+
+        if (updateGrain) updateGrain(timestamp);
+        if (updateCursor) updateCursor();
+        if (updateNav) updateNav(scrollY);
+
+        updateHero(scrollY, windowH);
+        updateStatement(scrollY, windowH);
+        updateDismantle(scrollY, windowH);
+
+        lastScrollY = scrollY;
+        requestAnimationFrame(masterTick);
+      }
+
+      requestAnimationFrame(masterTick);
+
+    } catch (e) {
+      console.error('Fatal initialization error:', e);
       const preloader = document.getElementById('preloader');
       if (preloader) preloader.classList.add('is-finished');
     }
